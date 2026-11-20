@@ -1,0 +1,65 @@
+﻿[LangOptions]
+LanguageName=简体中文
+LanguageID=$0804
+LanguageCodePage=936
+DialogFontName=Microsoft YaHei UI
+DialogFontSize=9
+WelcomeFontName=Microsoft YaHei UI
+WelcomeFontSize=12
+TitleFontName=Microsoft YaHei UI
+TitleFontSize=29
+CopyrightFontName=Microsoft YaHei UI
+CopyrightFontSize=9
+
+[Messages]
+SetupAppTitle=安装程序
+SetupWindowTitle=安装 - %1
+UninstallAppTitle=卸载
+UninstallAppFullTitle=卸载 %1
+ButtonBack=< 上一步(&B)
+ButtonNext=下一步(&N) >
+ButtonInstall=安装(&I)
+ButtonOK=确定
+ButtonCancel=取消
+ButtonYes=是(&Y)
+ButtonYesToAll=全部是(&A)
+ButtonNo=否(&N)
+ButtonNoToAll=全部否(&O)
+ButtonFinish=完成(&F)
+ButtonBrowse=浏览(&R)...
+ButtonWizardBrowse=浏览(&R)...
+ButtonNewFolder=新建文件夹(&M)
+SelectSetupModeTitle=选择安装模式
+SelectSetupModeLabel=选择要为哪些用户安装 %1：
+SelectSetupModeAllUsers=为所有用户安装（推荐）(&A)
+SelectSetupModeCurrentUser=仅为我安装(&M)
+WelcomeLabel1=欢迎使用 [name] 安装向导
+WelcomeLabel2=即将把 [name/ver] 安装到您的电脑上。%n%n建议在继续之前关闭所有其他应用程序。
+WizardSelectDir=选择目标位置
+SelectDirDesc=您想将 [name] 安装在什么地方？
+SelectDirLabel3=安装程序将把 [name] 安装到下列文件夹中。
+SelectDirBrowseLabel=如要继续，请单击“下一步”。如果您想选择其他文件夹，请单击“浏览”。
+DiskSpaceGBLabel=至少需要 [gb] GB 的可用磁盘空间。
+DiskSpaceMBLabel=至少需要 [mb] MB 的可用磁盘空间。
+WizardSelectTasks=选择附加任务
+SelectTasksDesc=您想要安装程序执行哪些附加任务？
+SelectTasksLabel2=选择在安装 [name] 时您想要安装程序执行的附加任务，然后单击“下一步”。
+WizardReady=准备安装
+ReadyLabel1=安装程序现在准备开始安装 [name] 到您的电脑中。
+ReadyLabel2a=单击“安装”继续此安装程序；如果您想回顾或改变设置，请单击“上一步”。
+WizardInstalling=正在安装
+InstallingLabel=正在安装 [name] 到您的电脑中，请稍候。
+FinishedHeadingLabel=正在完成 [name] 安装向导
+FinishedLabelNoIcons=安装程序已在您的电脑中安装了 [name]。
+FinishedLabel=安装程序已在您的电脑中安装了 [name]。您可以通过选择已安装的快捷方式来运行此应用程序。
+ClickFinish=单击“完成”退出安装程序。
+RunEntryShellExec=运行 %1
+ExitSetupTitle=退出安装程序
+ExitSetupMessage=安装尚未完成。如果您现在退出，该程序将不会被安装。%n%n您以后可以再次运行安装程序以完成安装。%n%n确定要退出安装程序吗？
+ConfirmUninstall=您确实想要完全移除 %1 及其所有组件吗？
+UninstalledAll=%1 已成功地从您的电脑中移除。
+
+[CustomMessages]
+AdditionalIcons=附加快捷方式：
+CreateDesktopIcon=创建桌面快捷方式(&D)
+LaunchProgram=安装完成后立即启动 %1
