@@ -51,7 +51,7 @@ BootCounter/
 ## 安装与构建
 
 ### 方式一：直接下载安装包
-前往本仓库右侧 **\[suspicious link removed\]** 页面，下载 `BootCounter_Setup_1.0.0.exe` 双击安装即可（自动跟随系统语言，支持选择「为所有用户安装」或「仅为我安装」）。
+前往本仓库右侧 **[Releases](https://github.com/Sssssystem/BootCounter/releases)** 页面，下载 `BootCounter_Setup_1.0.0.exe` 双击安装即可（自动跟随系统语言，支持选择「为所有用户安装」或「仅为我安装」）。
 
 ### 方式二：在 Windows 本地构建安装包
 1. 安装 [Python 3](https://www.python.org/downloads/)（勾选 `Add Python to PATH`）。
@@ -63,7 +63,7 @@ BootCounter/
 
 ## 致谢
 
-Powered by Google Gemini
+Powered by Google Gemini 4 Neon
 
 ## 许可证
 
