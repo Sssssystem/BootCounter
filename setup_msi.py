@@ -25,6 +25,7 @@ build_exe_options = {
     "excludes": ["unittest", "http", "urllib", "test", "pydoc"],
     "include_files": ["app.ico"] if ICON_FILE else [],
     "include_msvcr": True,
+    "optimize": 2,
 }
 
 bdist_msi_options = {
@@ -52,7 +53,7 @@ executables = [
 
 setup(
     name="BootCounter",
-    version="1.0.0",
+    version="1.1.0",
     description="Windows Boot and Wake Audit Counter",
     options={
         "build_exe": build_exe_options,

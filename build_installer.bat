@@ -73,6 +73,6 @@ if errorlevel 1 (
 echo.
 echo ======================================================
 echo   SUCCESS! Modern Installer created:
-echo   dist\BootCounter_Setup_1.0.0.exe
+echo   dist\BootCounter_Setup_1.1.0_amd64.exe
 echo ======================================================
 pause
