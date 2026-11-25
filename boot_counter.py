@@ -29,6 +29,49 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 
 IS_WINDOWS = sys.platform == "win32"
+IS_FROZEN = bool(getattr(sys, "frozen", False) or "__compiled__" in globals())
+
+LANG_AUTO = "auto"
+LANG_ZH = "zh"
+LANG_EN = "en"
+VALID_LANGS = (LANG_AUTO, LANG_ZH, LANG_EN)
+
+
+def detect_system_language() -> str:
+    """检测系统语言：中文系统返回 'zh'，英文及其他非中文系统一律默认返回 'en'。"""
+    override = os.environ.get("BOOTCOUNTER_LANG", "").strip().lower()
+    if override in (LANG_ZH, LANG_EN):
+        return override
+    if IS_WINDOWS:
+        try:
+            k32 = ctypes.windll.kernel32
+            k32.GetUserDefaultUILanguage.restype = ctypes.c_uint16
+            lang_id = k32.GetUserDefaultUILanguage()
+            # Primary language ID 0x04 = LANG_CHINESE
+            return LANG_ZH if (lang_id & 0x3FF) == 0x04 else LANG_EN
+        except Exception:
+            return LANG_EN
+    env_lang = (os.environ.get("LC_ALL") or os.environ.get("LANG") or "").lower()
+    return LANG_ZH if env_lang.startswith("zh") else LANG_EN
+
+
+CURRENT_LANG = detect_system_language()
+
+
+def apply_language_preference(pref: str) -> str:
+    global CURRENT_LANG
+    if pref == LANG_ZH:
+        CURRENT_LANG = LANG_ZH
+    elif pref == LANG_EN:
+        CURRENT_LANG = LANG_EN
+    else:
+        CURRENT_LANG = detect_system_language()
+    return CURRENT_LANG
+
+
+def tr(zh_text: str, en_text: str) -> str:
+    return zh_text if CURRENT_LANG == LANG_ZH else en_text
+
 if IS_WINDOWS:
     import winreg
 
@@ -101,6 +144,333 @@ def generate_os_install_id() -> str:
     return os.urandom(32).hex()
 
 
+
+TPM_KEY_NAME = "BootCounter_InstallKey_v1"
+TPM_PROVIDER_NAME = "Microsoft Platform Crypto Provider"
+
+
+def compute_self_binary_sha256() -> str:
+    """计算当前运行程序本体（BootCounter.exe 或源码）的 SHA-256 哈希，用于检测程序文件是否被替换篡改。"""
+    target = sys.executable if IS_FROZEN else os.path.abspath(__file__)
+    h = hashlib.sha256()
+    try:
+        with open(target, "rb") as f:
+            while True:
+                chunk = f.read(65536)
+                if not chunk:
+                    break
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return ""
+
+
+def dpapi_protect(plaintext: str) -> str:
+    """使用 Windows DPAPI (CryptProtectData) 加密敏感字符串，不以明文落盘。"""
+    if not IS_WINDOWS:
+        return ""
+    try:
+        class DATA_BLOB(ctypes.Structure):
+            _fields_ = [("cbData", ctypes.c_uint32), ("pbData", ctypes.POINTER(ctypes.c_ubyte))]
+
+        crypt32 = ctypes.windll.crypt32
+        kernel32 = ctypes.windll.kernel32
+        crypt32.CryptProtectData.argtypes = [
+            ctypes.POINTER(DATA_BLOB), ctypes.c_wchar_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(DATA_BLOB),
+        ]
+        crypt32.CryptProtectData.restype = ctypes.c_int
+        kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+        kernel32.LocalFree.restype = ctypes.c_void_p
+
+        raw = plaintext.encode("utf-8")
+        buf = (ctypes.c_ubyte * len(raw)).from_buffer_copy(raw)
+        in_blob = DATA_BLOB(len(raw), buf)
+        out_blob = DATA_BLOB()
+        # CRYPTPROTECT_UI_FORBIDDEN = 0x1
+        if not crypt32.CryptProtectData(ctypes.byref(in_blob), "BootCounter", None, None, None, 0x1, ctypes.byref(out_blob)):
+            return ""
+        try:
+            enc_bytes = ctypes.string_at(out_blob.pbData, out_blob.cbData)
+            return base64.b64encode(enc_bytes).decode("ascii")
+        finally:
+            kernel32.LocalFree(out_blob.pbData)
+    except Exception:
+        return ""
+
+
+def dpapi_unprotect(b64_cipher: str) -> str:
+    """使用 Windows DPAPI (CryptUnprotectData) 解密字符串。"""
+    if not IS_WINDOWS or not b64_cipher:
+        return ""
+    try:
+        class DATA_BLOB(ctypes.Structure):
+            _fields_ = [("cbData", ctypes.c_uint32), ("pbData", ctypes.POINTER(ctypes.c_ubyte))]
+
+        crypt32 = ctypes.windll.crypt32
+        kernel32 = ctypes.windll.kernel32
+        crypt32.CryptUnprotectData.argtypes = [
+            ctypes.POINTER(DATA_BLOB), ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(DATA_BLOB),
+        ]
+        crypt32.CryptUnprotectData.restype = ctypes.c_int
+        kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+        kernel32.LocalFree.restype = ctypes.c_void_p
+
+        enc_bytes = base64.b64decode(b64_cipher)
+        buf = (ctypes.c_ubyte * len(enc_bytes)).from_buffer_copy(enc_bytes)
+        in_blob = DATA_BLOB(len(enc_bytes), buf)
+        out_blob = DATA_BLOB()
+        if not crypt32.CryptUnprotectData(ctypes.byref(in_blob), None, None, None, None, 0x1, ctypes.byref(out_blob)):
+            return ""
+        try:
+            raw = ctypes.string_at(out_blob.pbData, out_blob.cbData)
+            return raw.decode("utf-8")
+        finally:
+            kernel32.LocalFree(out_blob.pbData)
+    except Exception:
+        return ""
+
+
+def _ncrypt_setup():
+    nc = ctypes.windll.ncrypt
+    nc.NCryptOpenStorageProvider.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_wchar_p, ctypes.c_uint32]
+    nc.NCryptOpenStorageProvider.restype = ctypes.c_uint32
+    nc.NCryptCreatePersistedKey.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p), ctypes.c_wchar_p,
+        ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_uint32,
+    ]
+    nc.NCryptCreatePersistedKey.restype = ctypes.c_uint32
+    nc.NCryptOpenKey.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p), ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_uint32,
+    ]
+    nc.NCryptOpenKey.restype = ctypes.c_uint32
+    nc.NCryptFinalizeKey.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    nc.NCryptFinalizeKey.restype = ctypes.c_uint32
+    nc.NCryptExportKey.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_void_p,
+        ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint32), ctypes.c_uint32,
+    ]
+    nc.NCryptExportKey.restype = ctypes.c_uint32
+    nc.NCryptDeleteKey.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    nc.NCryptDeleteKey.restype = ctypes.c_uint32
+    nc.NCryptSignHash.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32,
+        ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint32), ctypes.c_uint32,
+    ]
+    nc.NCryptSignHash.restype = ctypes.c_uint32
+    nc.NCryptVerifySignature.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32,
+        ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32,
+    ]
+    nc.NCryptVerifySignature.restype = ctypes.c_uint32
+    nc.NCryptFreeObject.argtypes = [ctypes.c_void_p]
+    nc.NCryptFreeObject.restype = ctypes.c_uint32
+    return nc
+
+
+def tpm_create_hardware_key() -> str:
+    """在主板 TPM 2.0 安全芯片中生成不可导出 ECDSA-P256 密钥，返回硬件公钥 SHA-256 指纹（失败返回空串）。"""
+    if not IS_WINDOWS:
+        return ""
+    h_prov = ctypes.c_void_p()
+    h_key = ctypes.c_void_p()
+    try:
+        nc = _ncrypt_setup()
+        if nc.NCryptOpenStorageProvider(ctypes.byref(h_prov), TPM_PROVIDER_NAME, 0) != 0:
+            return ""
+        # NCRYPT_OVERWRITE_KEY_FLAG = 0x80；默认不设导出标志，私钥永不可导出
+        if nc.NCryptCreatePersistedKey(h_prov, ctypes.byref(h_key), "ECDSA_P256", TPM_KEY_NAME, 0, 0x80) != 0:
+            return ""
+        if nc.NCryptFinalizeKey(h_key, 0) != 0:
+            return ""
+        out_len = ctypes.c_uint32(0)
+        if nc.NCryptExportKey(h_key, None, "ECCPUBLICBLOB", None, None, 0, ctypes.byref(out_len), 0) != 0 or out_len.value == 0:
+            return ""
+        buf = (ctypes.c_ubyte * out_len.value)()
+        if nc.NCryptExportKey(h_key, None, "ECCPUBLICBLOB", None, buf, out_len.value, ctypes.byref(out_len), 0) != 0:
+            return ""
+        return hashlib.sha256(bytes(buf[: out_len.value])).hexdigest()
+    except Exception:
+        return ""
+    finally:
+        try:
+            nc = ctypes.windll.ncrypt
+            if h_key.value:
+                nc.NCryptFreeObject(h_key)
+            if h_prov.value:
+                nc.NCryptFreeObject(h_prov)
+        except Exception:
+            pass
+
+
+def tpm_read_hardware_key_hash() -> str:
+    """读取当前主板 TPM 2.0 芯片中专属密钥的公钥 SHA-256 指纹（不存在则返回空串）。"""
+    if not IS_WINDOWS:
+        return ""
+    h_prov = ctypes.c_void_p()
+    h_key = ctypes.c_void_p()
+    try:
+        nc = _ncrypt_setup()
+        if nc.NCryptOpenStorageProvider(ctypes.byref(h_prov), TPM_PROVIDER_NAME, 0) != 0:
+            return ""
+        if nc.NCryptOpenKey(h_prov, ctypes.byref(h_key), TPM_KEY_NAME, 0, 0) != 0:
+            return ""
+        out_len = ctypes.c_uint32(0)
+        if nc.NCryptExportKey(h_key, None, "ECCPUBLICBLOB", None, None, 0, ctypes.byref(out_len), 0) != 0 or out_len.value == 0:
+            return ""
+        buf = (ctypes.c_ubyte * out_len.value)()
+        if nc.NCryptExportKey(h_key, None, "ECCPUBLICBLOB", None, buf, out_len.value, ctypes.byref(out_len), 0) != 0:
+            return ""
+        return hashlib.sha256(bytes(buf[: out_len.value])).hexdigest()
+    except Exception:
+        return ""
+    finally:
+        try:
+            nc = ctypes.windll.ncrypt
+            if h_key.value:
+                nc.NCryptFreeObject(h_key)
+            if h_prov.value:
+                nc.NCryptFreeObject(h_prov)
+        except Exception:
+            pass
+
+
+def tpm_destroy_hardware_key() -> bool:
+    """卸载或清理测试数据时，仅销毁本软件专属的 TPM 2.0 密钥（不影响系统任何其他功能）。"""
+    if not IS_WINDOWS:
+        return False
+    h_prov = ctypes.c_void_p()
+    h_key = ctypes.c_void_p()
+    try:
+        nc = _ncrypt_setup()
+        if nc.NCryptOpenStorageProvider(ctypes.byref(h_prov), TPM_PROVIDER_NAME, 0) != 0:
+            return False
+        if nc.NCryptOpenKey(h_prov, ctypes.byref(h_key), TPM_KEY_NAME, 0, 0) != 0:
+            return False
+        res = nc.NCryptDeleteKey(h_key, 0)
+        h_key = ctypes.c_void_p()  # NCryptDeleteKey 成功后自动释放句柄
+        return res == 0
+    except Exception:
+        return False
+    finally:
+        try:
+            nc = ctypes.windll.ncrypt
+            if h_key.value:
+                nc.NCryptFreeObject(h_key)
+            if h_prov.value:
+                nc.NCryptFreeObject(h_prov)
+        except Exception:
+            pass
+
+
+
+
+class BinaryTamperError(RuntimeError):
+    """程序本体完整性校验失败（与用户配置文件分离，触发后直接阻止程序运行）。"""
+
+
+def tpm_sign_hash(digest_hex: str) -> str:
+    """使用主板 TPM 2.0 不可导出私钥对程序本体 SHA-256 摘要做硬件 ECDSA-P256 签名（返回 Base64）。"""
+    if not IS_WINDOWS or not digest_hex:
+        return ""
+    h_prov = ctypes.c_void_p()
+    h_key = ctypes.c_void_p()
+    try:
+        digest = bytes.fromhex(digest_hex)
+        nc = _ncrypt_setup()
+        if nc.NCryptOpenStorageProvider(ctypes.byref(h_prov), TPM_PROVIDER_NAME, 0) != 0:
+            return ""
+        if nc.NCryptOpenKey(h_prov, ctypes.byref(h_key), TPM_KEY_NAME, 0, 0) != 0:
+            return ""
+        hash_buf = (ctypes.c_ubyte * len(digest)).from_buffer_copy(digest)
+        sig_len = ctypes.c_uint32(0)
+        if nc.NCryptSignHash(h_key, None, hash_buf, len(digest), None, 0, ctypes.byref(sig_len), 0) != 0 or sig_len.value == 0:
+            return ""
+        sig_buf = (ctypes.c_ubyte * sig_len.value)()
+        if nc.NCryptSignHash(h_key, None, hash_buf, len(digest), sig_buf, sig_len.value, ctypes.byref(sig_len), 0) != 0:
+            return ""
+        return base64.b64encode(bytes(sig_buf[: sig_len.value])).decode("ascii")
+    except Exception:
+        return ""
+    finally:
+        try:
+            nc = ctypes.windll.ncrypt
+            if h_key.value:
+                nc.NCryptFreeObject(h_key)
+            if h_prov.value:
+                nc.NCryptFreeObject(h_prov)
+        except Exception:
+            pass
+
+
+def tpm_verify_hash_signature(digest_hex: str, sig_b64: str) -> bool:
+    """使用主板 TPM 2.0 硬件密钥验证程序本体 SHA-256 摘要的硬件签名。"""
+    if not IS_WINDOWS or not digest_hex or not sig_b64:
+        return False
+    h_prov = ctypes.c_void_p()
+    h_key = ctypes.c_void_p()
+    try:
+        digest = bytes.fromhex(digest_hex)
+        sig = base64.b64decode(sig_b64)
+        nc = _ncrypt_setup()
+        if nc.NCryptOpenStorageProvider(ctypes.byref(h_prov), TPM_PROVIDER_NAME, 0) != 0:
+            return False
+        if nc.NCryptOpenKey(h_prov, ctypes.byref(h_key), TPM_KEY_NAME, 0, 0) != 0:
+            return False
+        hash_buf = (ctypes.c_ubyte * len(digest)).from_buffer_copy(digest)
+        sig_buf = (ctypes.c_ubyte * len(sig)).from_buffer_copy(sig)
+        return nc.NCryptVerifySignature(h_key, None, hash_buf, len(digest), sig_buf, len(sig), 0) == 0
+    except Exception:
+        return False
+    finally:
+        try:
+            nc = ctypes.windll.ncrypt
+            if h_key.value:
+                nc.NCryptFreeObject(h_key)
+            if h_prov.value:
+                nc.NCryptFreeObject(h_prov)
+        except Exception:
+            pass
+
+
+def check_debugger_attached() -> str:
+    """检测是否挂载了调试器或断点追踪器（IsDebuggerPresent / CheckRemoteDebuggerPresent / sys.gettrace）。"""
+    if sys.gettrace() is not None:
+        return tr("检测到 Python 调试器或断点追踪器", "Python debugger or breakpoint tracer detected")
+    if IS_WINDOWS:
+        try:
+            k32 = ctypes.windll.kernel32
+            k32.IsDebuggerPresent.restype = ctypes.c_int
+            if k32.IsDebuggerPresent():
+                return tr("检测到 Windows 用户态调试器附加", "Windows user-mode debugger attached")
+            k32.GetCurrentProcess.restype = ctypes.c_void_p
+            k32.CheckRemoteDebuggerPresent.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
+            k32.CheckRemoteDebuggerPresent.restype = ctypes.c_int
+            is_dbg = ctypes.c_int(0)
+            if k32.CheckRemoteDebuggerPresent(k32.GetCurrentProcess(), ctypes.byref(is_dbg)) and is_dbg.value:
+                return tr("检测到远程调试器附加", "Remote debugger attached")
+        except Exception:
+            pass
+    return ""
+
+
+def harden_process_anti_debug() -> None:
+    """调用 NtSetInformationThread(ThreadHideFromDebugger) 隐藏当前线程以抵御附加调试与断点。"""
+    if not IS_WINDOWS:
+        return
+    try:
+        k32 = ctypes.windll.kernel32
+        k32.GetCurrentThread.restype = ctypes.c_void_p
+        ntdll = ctypes.windll.ntdll
+        ntdll.NtSetInformationThread.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_uint32]
+        ntdll.NtSetInformationThread.restype = ctypes.c_uint32
+        # ThreadHideFromDebugger = 0x11
+        ntdll.NtSetInformationThread(k32.GetCurrentThread(), 0x11, None, 0)
+    except Exception:
+        pass
+
+
 def generate_strong_password(length: int = 16) -> str:
     """使用操作系统加密随机数生成器生成强密码（含大小写字母、数字与易读符号，避开 0/O/1/l/I 混淆字符）。"""
     upper = "ABCDEFGHJKLMNPQRSTUVWXYZ"
@@ -128,8 +498,10 @@ def generate_strong_password(length: int = 16) -> str:
     return "".join(chars)
 
 
-def derive_emoji_fingerprint(install_id: str, install_seal: str = "", count: int = EMOJI_FINGERPRINT_LEN) -> str:
-    digest = hashlib.sha256(f"BootCounter-Emoji-FP-v2:{install_id}:{install_seal}".encode("utf-8")).digest()
+def derive_emoji_fingerprint(
+    install_id: str, install_seal: str = "", tpm_pub_hash: str = "", count: int = EMOJI_FINGERPRINT_LEN
+) -> str:
+    digest = hashlib.sha256(f"BootCounter-Emoji-FP-v3:{install_id}:{install_seal}:{tpm_pub_hash}".encode("utf-8")).digest()
     bits_val = int.from_bytes(digest[:8], "big")
     return " ".join(EMOJI_POOL_64[(bits_val >> (i * 6)) & 0x3F] for i in range(count))
 
@@ -671,7 +1043,7 @@ def query_windows_system_events(since_epoch: float, since_record_id: int = 0, in
                     "epoch": round(ev_epoch, 2),
                     "record_id": record_id,
                     "kind": "log_cleared",
-                    "label": "严重异常：Windows 系统事件日志曾被人工清空（EventID 104）",
+                    "label": tr("严重异常：Windows 系统事件日志曾被人工清空（EventID 104）", "Critical Alert: Windows System Event Log was cleared (EventID 104)"),
                 }
             )
             continue
@@ -699,17 +1071,17 @@ def query_windows_system_events(since_epoch: float, since_record_id: int = 0, in
                         "epoch": round(ev_epoch, 2),
                         "record_id": record_id,
                         "kind": "clock_tamper",
-                        "label": f"可疑异常：系统时间被手动修改（跳变约 {diff_min} 分钟）",
+                        "label": tr(f"可疑异常：系统时间被手动修改（跳变约 {diff_min} 分钟）", f"Suspicious Alert: System clock changed manually (jump ~{diff_min} min)"),
                     }
                 )
             continue
 
         if provider == "Microsoft-Windows-Power-Troubleshooter" and event_id == "1":
-            kind, label = "sleep_wake", "睡眠/合盖唤醒"
+            kind, label = "sleep_wake", tr("睡眠/合盖唤醒", "Sleep / Lid Wake")
         elif provider == "Microsoft-Windows-Kernel-Boot" and event_id == "27":
-            kind, label = "fast_boot", "关机后开机（含快速启动）"
+            kind, label = "fast_boot", tr("关机后开机（含快速启动）", "Power On (Fast Startup)")
         else:
-            kind, label = "cold_boot", "冷启动/重启开机"
+            kind, label = "cold_boot", tr("冷启动/重启开机", "Cold Boot / Restart")
 
         result["power_events"].append(
             {"epoch": round(ev_epoch, 2), "record_id": record_id, "kind": kind, "label": label}
@@ -753,7 +1125,7 @@ def get_executable_command(mode: str = AUTOSTART_SILENT) -> str:
     if mode not in (AUTOSTART_SILENT, AUTOSTART_GUI):
         raise ValueError("无效的自启命令模式")
     flag = " --boot" if mode == AUTOSTART_SILENT else ""
-    if getattr(sys, "frozen", False):
+    if IS_FROZEN:
         return f'"{sys.executable}"{flag}'
     script_path = os.path.abspath(__file__)
     pythonw = sys.executable.replace("python.exe", "pythonw.exe")
@@ -812,7 +1184,7 @@ def refresh_autostart_path_if_needed(preferred_mode: str = AUTOSTART_SILENT) -> 
 
 def get_resource_path(filename: str) -> str:
     candidates = []
-    if getattr(sys, "frozen", False):
+    if IS_FROZEN:
         candidates.append(os.path.dirname(sys.executable))
         meipass = getattr(sys, "_MEIPASS", None)
         if meipass:
@@ -878,7 +1250,7 @@ class BootCounterStore:
 
     def _totp_enc_key(self) -> str:
         """基于本机安装 ID 与应用密钥派生的加密口令，避免 TOTP 密钥明文落盘，同时支持独立 TOTP 验证。"""
-        iid = (self.state or {}).get("install_id", "")
+        iid = self._get_effective_install_id()
         return f"{iid}:{HMAC_APP_SECRET.decode('ascii')}"
 
     def _write_audit_log(self, action: str, detail: str = "") -> None:
@@ -887,7 +1259,7 @@ class BootCounterStore:
         os.makedirs(os.path.dirname(self.log_path), exist_ok=True)
         line = (
             f"[{format_timestamp(time.time())}] "
-            f"INSTALL_ID={self.state.get('install_id', '-')} | "
+            f"INSTALL_ID={self._get_effective_install_id() or '-'} | "
             f"EMOJI={self.get_emoji_fingerprint()} | "
             f"BOOT_COUNT={self.state.get('boot_count', 0)} | "
             f"RESET_COUNT={self.state.get('reset_count', 0)} | "
@@ -901,11 +1273,48 @@ class BootCounterStore:
         except OSError:
             pass
 
+    def _get_effective_install_id(self, data: dict = None) -> str:
+        d = data if data is not None else (self.state or {})
+        if d.get("install_id_dpapi") and IS_WINDOWS:
+            plain = dpapi_unprotect(d["install_id_dpapi"])
+            if plain:
+                return plain
+        return d.get("install_id", "")
+
     def get_emoji_fingerprint(self) -> str:
-        if not self.state or not self.state.get("install_id"):
+        if not self.state:
+            return ""
+        iid = self._get_effective_install_id()
+        if not iid:
             return ""
         seal = get_install_seal() or self.state.get("install_seal", "")
-        return derive_emoji_fingerprint(self.state["install_id"], seal)
+        tpm_h = self.state.get("tpm_pub_hash", "")
+        return derive_emoji_fingerprint(iid, seal, tpm_h)
+
+    def verify_binary_integrity_or_raise(self) -> None:
+        """严格校验程序本体 SHA-256（含 DPAPI 解密与 TPM 2.0 硬件签名验签）。仅程序本体被篡改时抛 BinaryTamperError 阻止运行，不影响修改密码等配置操作。"""
+        if not self.state:
+            return
+        cur_sha = compute_self_binary_sha256()
+        if not cur_sha:
+            return
+        stored_dpapi = self.state.get("app_binary_sha256_dpapi", "")
+        stored_plain = self.state.get("app_binary_sha256", "")
+        stored_tpm_sig = self.state.get("app_binary_tpm_sig", "")
+
+        expected_sha = dpapi_unprotect(stored_dpapi) if (stored_dpapi and IS_WINDOWS) else stored_plain
+        if stored_dpapi and IS_WINDOWS and not expected_sha:
+            self._write_audit_log("BINARY_TAMPER_BLOCKED", "DPAPI 程序哈希解密失败")
+            raise BinaryTamperError(tr("程序完整性校验失败：无法解密已绑定的程序 SHA-256 指纹，已停止运行。", "Integrity check failed: unable to decrypt bound binary SHA-256. Execution halted."))
+
+        if expected_sha and not hmac.compare_digest(expected_sha, cur_sha):
+            self._write_audit_log("BINARY_TAMPER_BLOCKED", f"expected={expected_sha[:16]} actual={cur_sha[:16]}")
+            raise BinaryTamperError(tr("程序完整性校验失败：检测到程序本体文件已被修改或替换，已拒绝运行。", "Integrity check failed: application binary has been modified or replaced. Execution halted."))
+
+        if stored_tpm_sig and IS_WINDOWS:
+            if not tpm_verify_hash_signature(cur_sha, stored_tpm_sig):
+                self._write_audit_log("BINARY_TAMPER_BLOCKED", "TPM 2.0 硬件签名验签失败")
+                raise BinaryTamperError(tr("程序完整性校验失败：主板 TPM 2.0 硬件签名验证未通过，程序可能已被篡改，已停止运行。", "Integrity check failed: TPM 2.0 hardware signature verification failed. Execution halted."))
 
     def exists(self) -> bool:
         return os.path.exists(self.data_path)
@@ -915,7 +1324,7 @@ class BootCounterStore:
             return
         try:
             with winreg.CreateKey(winreg.HKEY_CURRENT_USER, REG_APP_PATH) as key:
-                winreg.SetValueEx(key, "InstallID", 0, winreg.REG_SZ, str(self.state.get("install_id", "")))
+                winreg.SetValueEx(key, "InstallID", 0, winreg.REG_SZ, hashlib.sha256(self._get_effective_install_id().encode("utf-8")).hexdigest()[:32])
                 winreg.SetValueEx(key, "BootCount", 0, winreg.REG_DWORD, max(0, int(self.state.get("boot_count", 0))))
                 winreg.SetValueEx(key, "ResetCount", 0, winreg.REG_DWORD, max(0, int(self.state.get("reset_count", 0))))
                 winreg.SetValueEx(key, "LastRecordID", 0, winreg.REG_SZ, str(self.state.get("last_event_record_id", 0)))
@@ -945,15 +1354,39 @@ class BootCounterStore:
         anchor = self._read_registry_anchor()
         return bool(anchor.get("InstallID") or anchor.get("Signature"))
 
+    def _encode_state_file(self, wrapped: dict) -> str:
+        raw_json = json.dumps(wrapped, ensure_ascii=False, separators=(",", ":"))
+        if IS_WINDOWS:
+            dpapi_ct = dpapi_protect(raw_json)
+            if dpapi_ct:
+                return "BCENC1:" + dpapi_ct
+        enc_blob = encrypt_secret(raw_json, HMAC_APP_SECRET.decode("ascii"))
+        return "BCENC2:" + base64.b64encode(json.dumps(enc_blob, separators=(",", ":")).encode("utf-8")).decode("ascii")
+
+    def _decode_state_file(self, raw_text: str) -> dict:
+        text = raw_text.strip()
+        if text.startswith("BCENC1:"):
+            plain = dpapi_unprotect(text[7:])
+            if not plain:
+                raise ValueError("DPAPI 配置文件解密失败")
+            return json.loads(plain)
+        if text.startswith("BCENC2:"):
+            blob = json.loads(base64.b64decode(text[7:]).decode("utf-8"))
+            plain = decrypt_secret(blob, HMAC_APP_SECRET.decode("ascii"))
+            return json.loads(plain)
+        # 兼容旧版明文 JSON（下次保存会自动升级为全密文）
+        return json.loads(text)
+
     def save(self) -> None:
         os.makedirs(os.path.dirname(self.data_path), exist_ok=True)
         payload = {k: v for k, v in self.state.items() if k != "integrity"}
         sig = self._compute_hmac(payload)
         wrapped = dict(payload)
         wrapped["integrity"] = sig
+        encoded = self._encode_state_file(wrapped)
         tmp_path = self.data_path + ".tmp"
         with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(wrapped, f, ensure_ascii=False, indent=2)
+            f.write(encoded)
         os.replace(tmp_path, self.data_path)
         self.state = wrapped
         self._save_registry_anchor()
@@ -983,7 +1416,7 @@ class BootCounterStore:
             return False
         try:
             with open(self.data_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
+                data = self._decode_state_file(f.read())
             stored_sig = data.get("integrity", "")
             payload = {k: v for k, v in data.items() if k != "integrity"}
             expected_sig = self._compute_hmac(payload)
@@ -1001,8 +1434,28 @@ class BootCounterStore:
                 self.tampered = True
                 self.tamper_reasons.append("检测到程序被重新安装且有人覆盖了旧状态文件（安装封条不匹配）")
 
-            if data.get("install_id") and data.get("emoji_fingerprint"):
-                expected_fp = derive_emoji_fingerprint(data["install_id"], cur_seal or stored_seal)
+            # 校验程序本体 SHA-256 完整性（防止替换伪造程序）
+            stored_bin_hash = data.get("app_binary_sha256", "")
+            cur_bin_hash = compute_self_binary_sha256()
+            if stored_bin_hash and cur_bin_hash and not hmac.compare_digest(stored_bin_hash, cur_bin_hash):
+                self.tampered = True
+                self.tamper_reasons.append("程序本体文件 SHA-256 校验不匹配（疑似程序文件被替换或修改）")
+
+            # 校验 TPM 2.0 硬件不可导出密钥
+            stored_tpm = data.get("tpm_pub_hash", "")
+            if stored_tpm and IS_WINDOWS:
+                live_tpm = tpm_read_hardware_key_hash()
+                if not live_tpm or not hmac.compare_digest(stored_tpm, live_tpm):
+                    self.tampered = True
+                    self.tamper_reasons.append("主板 TPM 2.0 硬件密钥缺失或不匹配（疑似卸载重装或跨机复制）")
+
+            eff_iid = self._get_effective_install_id(data)
+            if data.get("install_id_dpapi") and IS_WINDOWS and not eff_iid:
+                self.tampered = True
+                self.tamper_reasons.append("DPAPI 加密安装密钥解密失败（疑似跨账户或跨设备复制）")
+
+            if eff_iid and data.get("emoji_fingerprint"):
+                expected_fp = derive_emoji_fingerprint(eff_iid, cur_seal or stored_seal, stored_tpm)
                 if not hmac.compare_digest(
                     data["emoji_fingerprint"].encode("utf-8"), expected_fp.encode("utf-8")
                 ):
@@ -1017,7 +1470,8 @@ class BootCounterStore:
                 reg_reset = int(anchor.get("ResetCount", 0) or 0)
                 file_rec = int(data.get("last_event_record_id", 0) or 0)
                 file_reset = int(data.get("reset_count", 0) or 0)
-                if reg_id and data.get("install_id") and reg_id != data.get("install_id"):
+                eff_id_hash = hashlib.sha256(eff_iid.encode("utf-8")).hexdigest()[:32] if eff_iid else ""
+                if reg_id and eff_iid and reg_id not in (eff_iid, eff_id_hash):
                     self.tampered = True
                     self.tamper_reasons.append("安装标识与注册表锚点不匹配（疑似覆盖了其他状态文件）")
                 elif reg_reset > file_reset:
@@ -1041,6 +1495,8 @@ class BootCounterStore:
             data.setdefault("last_event_epoch", data.get("last_boot_epoch", 0.0))
             data.setdefault("last_event_record_id", 0)
             data.setdefault("history_base_hash", "GENESIS")
+            data.setdefault("language", LANG_AUTO)
+            apply_language_preference(data.get("language", LANG_AUTO))
             data.setdefault("security_anomalies", [])
             self._migrate_legacy_policy(data)
             self.state = data
@@ -1097,12 +1553,18 @@ class BootCounterStore:
 
         install_id = generate_os_install_id()
         install_seal = get_install_seal()
-        emoji_fp = derive_emoji_fingerprint(install_id, install_seal)
+        tpm_pub_hash = tpm_create_hardware_key()
+        dpapi_blob = dpapi_protect(install_id) if IS_WINDOWS else ""
+        key_storage_mode = "TPM 2.0 + DPAPI" if (tpm_pub_hash and dpapi_blob) else ("TPM 2.0" if tpm_pub_hash else ("DPAPI" if dpapi_blob else "Local"))
+        bin_sha256 = compute_self_binary_sha256()
+        bin_tpm_sig = tpm_sign_hash(bin_sha256) if tpm_pub_hash else ""
+        bin_sha256_dpapi = dpapi_protect(bin_sha256) if (IS_WINDOWS and bin_sha256) else ""
+        emoji_fp = derive_emoji_fingerprint(install_id, install_seal, tpm_pub_hash)
 
         first_entry = {
             "time": format_timestamp(now),
             "recorded_at": format_timestamp(now),
-            "event": "软件安装并首次运行（计为第 1 次）",
+            "event": tr("软件安装并首次运行（计为第 1 次）", "Initial installation and first run (Count: 1)"),
             "count_after": 1,
         }
         first_entry["hash"] = self._compute_entry_hash("GENESIS", first_entry)
@@ -1118,8 +1580,14 @@ class BootCounterStore:
             )
 
         self.state = {
-            "version": 7,
-            "install_id": install_id,
+            "version": 8,
+            "install_id": "" if dpapi_blob else install_id,
+            "install_id_dpapi": dpapi_blob,
+            "tpm_pub_hash": tpm_pub_hash,
+            "key_storage_mode": key_storage_mode,
+            "app_binary_sha256": "" if bin_sha256_dpapi else bin_sha256,
+            "app_binary_sha256_dpapi": bin_sha256_dpapi,
+            "app_binary_tpm_sig": bin_tpm_sig,
             "install_seal": install_seal,
             "emoji_fingerprint": emoji_fp,
             "installed_at": format_timestamp(now),
@@ -1130,6 +1598,7 @@ class BootCounterStore:
             "last_event_record_id": rec_id,
             "count_sleep_wake": bool(count_sleep_wake),
             "autostart_mode": autostart_mode,
+            "language": LANG_AUTO,
             "clear_logic": clear_logic,
             "clear_methods": methods,
             "clear_mode": CLEAR_MODE_DISABLED if clear_logic == CLEAR_LOGIC_DISABLED else CLEAR_MODE_PASSWORD,
@@ -1450,12 +1919,32 @@ class BootCounterStore:
         cur_seal = get_install_seal()
         if cur_seal:
             self.state["install_seal"] = cur_seal
+        cur_bin = compute_self_binary_sha256()
+        if cur_bin:
+            if IS_WINDOWS and self.state.get("app_binary_sha256_dpapi"):
+                new_dp = dpapi_protect(cur_bin)
+                if new_dp:
+                    self.state["app_binary_sha256_dpapi"] = new_dp
+                    self.state["app_binary_sha256"] = ""
+            else:
+                self.state["app_binary_sha256"] = cur_bin
         self.state["emoji_fingerprint"] = self.get_emoji_fingerprint()
         self.tampered = False
         self.tamper_reasons = []
         self._append_history(now, f"通过【{method_desc}】消除界面安全告警（共 {len(dismissed_items)} 项）", now_epoch=now)
         self.save()
         self._write_audit_log("DISMISS_ALERTS", f"method={method_desc}, count={len(dismissed_items)}, items={'; '.join(dismissed_items)}")
+
+    def set_language(self, lang_pref: str) -> str:
+        if self.state is None:
+            raise RuntimeError(tr("尚未初始化状态", "State not initialized"))
+        if lang_pref not in VALID_LANGS:
+            raise ValueError(tr("无效的语言设置", "Invalid language setting"))
+        self.state["language"] = lang_pref
+        active = apply_language_preference(lang_pref)
+        self.save()
+        self._write_audit_log("SET_LANGUAGE", f"pref={lang_pref}, active={active}")
+        return active
 
     def set_autostart_preference(self, mode: str, password: str) -> None:
         if self.state is None:
@@ -1497,50 +1986,52 @@ class BootCounterStore:
     def format_policy_summary(self) -> str:
         st = self.state or {}
         if st.get("permanent_lock"):
-            return "永久锁定禁止清除"
+            return tr("永久锁定禁止清除", "Permanently Locked")
         logic = st.get("clear_logic", CLEAR_LOGIC_ANY)
         if logic == CLEAR_LOGIC_DISABLED:
-            return "完全禁止清除"
-        labels = {METHOD_PASSWORD: "密码", METHOD_TOTP: "动态口令", METHOD_WINHELLO: "Windows Hello"}
+            return tr("完全禁止清除", "Clear Disabled")
+        labels = {METHOD_PASSWORD: tr("密码", "Password"), METHOD_TOTP: tr("动态口令", "TOTP"), METHOD_WINHELLO: "Windows Hello"}
         m_text = " / ".join(labels[m] for m in st.get("clear_methods", [METHOD_PASSWORD]) if m in labels)
-        return f"任一可清({m_text})" if logic == CLEAR_LOGIC_ANY else f"全部需验({m_text.replace(' / ', '+')})"
+        return tr(f"任一可清({m_text})", f"Any ({m_text})") if logic == CLEAR_LOGIC_ANY else tr(f"全部需验({m_text.replace(' / ', '+')})", f"All ({m_text.replace(' / ', '+')})")
 
     def build_audit_report(self) -> str:
         st = self.state or {}
         anomalies = st.get("security_anomalies", [])
         lines = [
             "========================================",
-            "   BootCounter 开机与唤醒防篡改审计报告",
+            tr("   BootCounter 开机与唤醒防篡改审计报告", "   BootCounter Tamper-Evident Audit Report"),
             "========================================",
-            f"生成时间：{format_timestamp(time.time())}",
-            f"安装防伪 Emoji 指纹（6位）：{self.get_emoji_fingerprint()}",
-            f"底层随机安装 ID（仅日志可见）：{st.get('install_id', '-')}",
-            f"安装时间：{st.get('installed_at', '-')}",
-            f"累计开机/唤醒次数：{st.get('boot_count', 0)} 次",
-            f"累计清除/重置次数（不可清零）：{st.get('reset_count', 0)} 次",
-            f"合盖睡眠唤醒统计：{'开启' if st.get('count_sleep_wake', True) else '关闭'}",
-            f"清空保护策略：{self.format_policy_summary()}",
-            f"文件与哈希链完整性：{'异常！' if self.tampered else '正常（通过）'}",
+            tr(f"生成时间：{format_timestamp(time.time())}", f"Generated At: {format_timestamp(time.time())}"),
+            tr(f"安装防伪 Emoji 指纹（6位）：{self.get_emoji_fingerprint()}", f"Install Emoji Fingerprint (6): {self.get_emoji_fingerprint()}"),
+            tr(f"底层随机安装 ID（仅日志可见）：{self._get_effective_install_id() or '-'}", f"Internal Random Install ID: {self._get_effective_install_id() or '-'}"),
+            tr(f"密钥安全存储方式：{st.get('key_storage_mode', 'Local')}", f"Key Protection Mode: {st.get('key_storage_mode', 'Local')}"),
+            tr(f"程序本体 SHA-256：{(dpapi_unprotect(st.get('app_binary_sha256_dpapi', '')) if IS_WINDOWS else '') or st.get('app_binary_sha256', '') or compute_self_binary_sha256() or '-'}", f"Binary SHA-256: {(dpapi_unprotect(st.get('app_binary_sha256_dpapi', '')) if IS_WINDOWS else '') or st.get('app_binary_sha256', '') or compute_self_binary_sha256() or '-'}"),
+            tr(f"安装时间：{st.get('installed_at', '-')}", f"Installed At: {st.get('installed_at', '-')}"),
+            tr(f"累计开机/唤醒次数：{st.get('boot_count', 0)} 次", f"Total Boot / Wake Count: {st.get('boot_count', 0)}"),
+            tr(f"累计清除/重置次数：{st.get('reset_count', 0)} 次", f"Total Reset Count (Permanent): {st.get('reset_count', 0)}"),
+            tr(f"合盖睡眠唤醒统计：{'开启' if st.get('count_sleep_wake', True) else '关闭'}", f"Sleep / Lid Wake Tracking: {'Enabled' if st.get('count_sleep_wake', True) else 'Disabled'}"),
+            tr(f"清空保护策略：{self.format_policy_summary()}", f"Clear Protection Policy: {self.format_policy_summary()}"),
+            tr(f"文件与哈希链完整性：{'异常！' if self.tampered else '正常（通过）'}", f"File & Hash Chain Integrity: {'TAMPERED!' if self.tampered else 'OK (Verified)'}"),
         ]
         if self.tamper_reasons:
-            lines.append("完整性告警详情：")
+            lines.append(tr("完整性告警详情：", "Integrity Alert Details:"))
             for r in self.tamper_reasons:
                 lines.append(f"  - {r}")
         dismissed = st.get("dismissed_alerts", [])
-        lines.append(f"当前未消除异常数：{len(anomalies)} 条（历史已消除告警：{len(dismissed)} 次）")
+        lines.append(tr(f"当前未消除异常数：{len(anomalies)} 条（历史已消除告警：{len(dismissed)} 次）", f"Active Security Alerts: {len(anomalies)} (Historically Dismissed: {len(dismissed)})"))
         if dismissed:
-            lines.append("历史告警消除记录（永久留痕）：")
+            lines.append(tr("历史告警消除记录（永久留痕）：", "Dismissed Alert History (Permanent):"))
             for d in dismissed:
-                lines.append(f"  - [{d.get('time')}] 通过【{d.get('method')}】消除了 {d.get('count')} 项告警")
+                lines.append(tr(f"  - [{d.get('time')}] 通过【{d.get('method')}】消除了 {d.get('count')} 项告警", f"  - [{d.get('time')}] Dismissed {d.get('count')} alert(s) via [{d.get('method')}]"))
         if anomalies:
-            lines.append("系统异常明细（清日志/改时间/重装）：")
+            lines.append(tr("系统异常明细（清日志/改时间/重装）：", "System Security Alerts:"))
             for a in anomalies:
                 lines.append(f"  - [{a.get('time')}] {a.get('label')}")
         lines.append("----------------------------------------")
-        lines.append("开机与唤醒记录（按时间顺序）：")
+        lines.append(tr("开机与唤醒记录（按时间顺序）：", "Boot & Wake History (Chronological):"))
         for idx, item in enumerate(st.get("boot_history", []), start=1):
             lines.append(
-                f"  {idx}. [{item.get('time')}] {item.get('event')} -> 累计 {item.get('count_after')} 次 (Hash: {item.get('hash', '-')})"
+                tr(f"  {idx}. [{item.get('time')}] {item.get('event')} -> 累计 {item.get('count_after')} 次 (Hash: {item.get('hash', '-')})", f"  {idx}. [{item.get('time')}] {item.get('event')} -> Total {item.get('count_after')} (Hash: {item.get('hash', '-')})")
             )
         lines.append("========================================")
         return "\n".join(lines)
@@ -1737,10 +2228,10 @@ class Win32TrayIcon:
                         return 0
                     elif lparam == self.WM_RBUTTONUP:
                         hmenu = user32.CreatePopupMenu()
-                        user32.AppendMenuW(hmenu, self.MF_STRING, self.ID_SHOW, "打开 BootCounter")
-                        user32.AppendMenuW(hmenu, self.MF_STRING, self.ID_SYNC, "立即同步日志")
+                        user32.AppendMenuW(hmenu, self.MF_STRING, self.ID_SHOW, tr("打开 BootCounter", "Open BootCounter"))
+                        user32.AppendMenuW(hmenu, self.MF_STRING, self.ID_SYNC, tr("立即同步日志", "Sync Logs Now"))
                         user32.AppendMenuW(hmenu, self.MF_SEPARATOR, 0, None)
-                        user32.AppendMenuW(hmenu, self.MF_STRING, self.ID_EXIT, "退出程序")
+                        user32.AppendMenuW(hmenu, self.MF_STRING, self.ID_EXIT, tr("退出程序", "Exit"))
                         pt = POINT()
                         user32.GetCursorPos(ctypes.byref(pt))
                         user32.SetForegroundWindow(hwnd)
@@ -1847,10 +2338,10 @@ def launch_gui(store: BootCounterStore) -> None:
     DANGER_BG = "#FDE7E9"
     SUCCESS = "#107C10"
     SUCCESS_BG = "#DFF6DD"
-    FONT_UI = "Microsoft YaHei UI"
+    FONT_UI = "Microsoft YaHei UI" if CURRENT_LANG == LANG_ZH else "Segoe UI"
 
     root = tk.Tk()
-    root.title("BootCounter — 开机与唤醒审计")
+    root.title(tr("BootCounter — 开机与唤醒审计", "BootCounter — Boot & Wake Audit"))
     root.configure(bg=BG_MICA)
 
     dpi_scale = max(1.0, root.winfo_fpixels("1i") / 96.0)
@@ -1929,7 +2420,7 @@ def launch_gui(store: BootCounterStore) -> None:
         uri = build_otpauth_uri(new_secret)
 
         t_win = tk.Toplevel(parent_win)
-        t_win.title("绑定动态口令")
+        t_win.title(tr("绑定动态口令", "Bind Authenticator (TOTP)"))
         t_win.configure(bg=BG_MICA)
         _center_window(t_win, sc(460), sc(560))
         t_win.minsize(sc(420), sc(500))
@@ -1938,7 +2429,7 @@ def launch_gui(store: BootCounterStore) -> None:
 
         tk.Label(
             t_win,
-            text="使用 iPhone 相机 / 自带「密码」App 或手机验证器扫描下方二维码：",
+            text=tr("使用 iPhone 相机 / 自带「密码」App 或手机验证器扫描下方二维码：", "Scan this QR code with iPhone Camera / Passwords or any Authenticator app:"),
             bg=BG_MICA,
             fg=TEXT_PRIMARY,
             justify="left",
@@ -1962,7 +2453,7 @@ def launch_gui(store: BootCounterStore) -> None:
                     x0 = (c + quiet) * cell
                     qr_canvas.create_rectangle(x0, y0, x0 + cell, y0 + cell, fill="#000000", outline="")
 
-        tk.Label(t_win, text="或手动输入密钥：", bg=BG_MICA, fg=TEXT_SECONDARY, font=(FONT_UI, 8)).pack(
+        tk.Label(t_win, text=tr("或手动输入密钥：", "Or enter setup key manually:"), bg=BG_MICA, fg=TEXT_SECONDARY, font=(FONT_UI, 8)).pack(
             padx=sc(18), pady=(sc(2), sc(2)), anchor="w"
         )
         sec_entry = tk.Entry(t_win, font=("Consolas", 10, "bold"), justify="center")
@@ -1974,18 +2465,18 @@ def launch_gui(store: BootCounterStore) -> None:
         cp_row.pack(pady=sc(4))
         make_btn(
             cp_row,
-            "复制密钥",
-            lambda: (root.clipboard_clear(), root.clipboard_append(new_secret), messagebox.showinfo("已复制", "Base32 密钥已复制。", parent=t_win)),
+            tr("复制密钥", "Copy Key"),
+            lambda: (root.clipboard_clear(), root.clipboard_append(new_secret), messagebox.showinfo(tr("已复制", "Copied"), tr("Base32 密钥已复制。", "Base32 secret key copied."), parent=t_win)),
             compact=True,
         ).pack(side="left", padx=sc(4))
         make_btn(
             cp_row,
-            "复制 otpauth 链接",
-            lambda: (root.clipboard_clear(), root.clipboard_append(uri), messagebox.showinfo("已复制", "otpauth 链接已复制。", parent=t_win)),
+            tr("复制 otpauth 链接", "Copy otpauth URI"),
+            lambda: (root.clipboard_clear(), root.clipboard_append(uri), messagebox.showinfo(tr("已复制", "Copied"), tr("otpauth 链接已复制。", "otpauth URI copied."), parent=t_win)),
             compact=True,
         ).pack(side="left", padx=sc(4))
 
-        tk.Label(t_win, text="扫码添加后，输入手机显示的 6 位验证码完成绑定：", bg=BG_MICA, fg=TEXT_PRIMARY, font=(FONT_UI, 9)).pack(
+        tk.Label(t_win, text=tr("扫码添加后，输入手机显示的 6 位验证码完成绑定：", "Enter the 6-digit code from your phone to verify:"), bg=BG_MICA, fg=TEXT_PRIMARY, font=(FONT_UI, 9)).pack(
             padx=sc(18), pady=(sc(8), sc(4)), anchor="w"
         )
         code_var = tk.StringVar()
@@ -1994,12 +2485,12 @@ def launch_gui(store: BootCounterStore) -> None:
         def do_verify():
             code = code_var.get().strip()
             if not verify_totp_code(new_secret, code):
-                messagebox.showerror("校验失败", "6 位动态口令不正确或已过期，请检查手机时间后重试。", parent=t_win)
+                messagebox.showerror(tr("校验失败", "Verification Failed"), tr("6 位动态口令不正确或已过期，请检查手机时间后重试。", "Invalid or expired 6-digit TOTP code. Check phone time and try again."), parent=t_win)
                 return
             on_success(new_secret, code)
             t_win.destroy()
 
-        make_btn(t_win, "验证并绑定", do_verify, primary=True).pack(pady=sc(10))
+        make_btn(t_win, tr("验证并绑定", "Verify & Bind"), do_verify, primary=True).pack(pady=sc(10))
 
     # =========================
     # 首次安装初始化向导（含强密码生成 + TOTP 绑定 + Windows Hello + 多方式选择 + 平滑进度条）
@@ -2007,7 +2498,7 @@ def launch_gui(store: BootCounterStore) -> None:
     if not store.exists():
         had_orphan = store.has_orphan_registry_anchor()
         setup_win = tk.Toplevel(root)
-        setup_win.title("BootCounter 首次安装设置")
+        setup_win.title(tr("BootCounter 首次安装设置", "BootCounter Initial Setup"))
         setup_win.configure(bg=BG_MICA)
         _center_window(setup_win, sc(540), sc(680))
         setup_win.minsize(sc(480), sc(580))
@@ -2015,12 +2506,12 @@ def launch_gui(store: BootCounterStore) -> None:
         _apply_win11_window_style(setup_win, _ico)
         root.withdraw()
 
-        tk.Label(setup_win, text="欢迎安装 BootCounter", bg=BG_MICA, fg=TEXT_PRIMARY, font=(FONT_UI, 14, "bold")).pack(
+        tk.Label(setup_win, text=tr("欢迎安装 BootCounter", "Welcome to BootCounter"), bg=BG_MICA, fg=TEXT_PRIMARY, font=(FONT_UI, 14, "bold")).pack(
             anchor="w", padx=sc(20), pady=(sc(14), sc(2))
         )
         tk.Label(
             setup_win,
-            text="首次配置完成后，本次开机将记为第 1 次。",
+            text=tr("首次配置完成后，本次开机将记为第 1 次。", "After setup, this session will be recorded as boot #1."),
             bg=BG_MICA,
             fg=TEXT_SECONDARY,
             font=(FONT_UI, 9),
@@ -2029,7 +2520,7 @@ def launch_gui(store: BootCounterStore) -> None:
         if had_orphan:
             tk.Label(
                 setup_win,
-                text="⚠ 检测到旧注册表锚点残留（疑似原文件被删除重装），已记入审计异常",
+                text=tr("⚠ 检测到旧注册表锚点残留（疑似原文件被删除重装），已记入审计异常", "⚠ Leftover registry anchor detected (suspected reinstall). Logged as security alert."),
                 bg=DANGER_BG,
                 fg=DANGER,
                 font=(FONT_UI, 9, "bold"),
@@ -2043,7 +2534,7 @@ def launch_gui(store: BootCounterStore) -> None:
         # 1. 管理密码 + 一键生成强密码 + 显示/复制
         pwd_hdr = tk.Frame(frm, bg=BG_CARD)
         pwd_hdr.pack(fill="x")
-        tk.Label(pwd_hdr, text="管理密码", bg=BG_CARD, fg=TEXT_PRIMARY, font=(FONT_UI, 9, "bold")).pack(side="left")
+        tk.Label(pwd_hdr, text=tr("管理密码", "Admin Password"), bg=BG_CARD, fg=TEXT_PRIMARY, font=(FONT_UI, 9, "bold")).pack(side="left")
 
         pwd1_var = tk.StringVar()
         pwd2_var = tk.StringVar()
@@ -2056,25 +2547,25 @@ def launch_gui(store: BootCounterStore) -> None:
             show_pwd["v"] = True
             e_pwd1.configure(show="")
             e_pwd2.configure(show="")
-            btn_eye.configure(text="隐藏")
+            btn_eye.configure(text=tr("隐藏", "Hide"))
             root.clipboard_clear()
             root.clipboard_append(gp)
-            messagebox.showinfo("已生成强密码", f"已使用系统随机数生成 16 位强密码并复制到剪贴板：\n\n{gp}\n\n请务必妥善保存！", parent=setup_win)
+            messagebox.showinfo(tr("已生成强密码", "Strong Password Generated"), tr(f"已使用系统随机数生成 16 位强密码并复制到剪贴板：\n\n{gp}\n\n请务必妥善保存！", f"Generated a 16-char strong password and copied to clipboard:\n\n{gp}\n\nPlease save it securely!"), parent=setup_win)
 
         def on_toggle_eye():
             show_pwd["v"] = not show_pwd["v"]
             ch = "" if show_pwd["v"] else "*"
             e_pwd1.configure(show=ch)
             e_pwd2.configure(show=ch)
-            btn_eye.configure(text="隐藏" if show_pwd["v"] else "显示")
+            btn_eye.configure(text=tr("隐藏", "Hide") if show_pwd["v"] else tr("显示", "Show"))
 
-        btn_eye = make_btn(pwd_hdr, "显示", on_toggle_eye, compact=True)
+        btn_eye = make_btn(pwd_hdr, tr("显示", "Show"), on_toggle_eye, compact=True)
         btn_eye.pack(side="right", padx=(sc(4), 0))
-        make_btn(pwd_hdr, "🎲 生成强密码", on_gen_pwd, compact=True).pack(side="right")
+        make_btn(pwd_hdr, tr("🎲 生成强密码", "🎲 Generate"), on_gen_pwd, compact=True).pack(side="right")
 
         e_pwd1 = tk.Entry(frm, textvariable=pwd1_var, show="*", font=("Consolas", 10))
         e_pwd1.pack(fill="x", pady=(sc(4), sc(6)))
-        tk.Label(frm, text="确认管理密码", bg=BG_CARD, fg=TEXT_SECONDARY, font=(FONT_UI, 8)).pack(anchor="w")
+        tk.Label(frm, text=tr("确认管理密码", "Confirm Password"), bg=BG_CARD, fg=TEXT_SECONDARY, font=(FONT_UI, 8)).pack(anchor="w")
         e_pwd2 = tk.Entry(frm, textvariable=pwd2_var, show="*", font=("Consolas", 10))
         e_pwd2.pack(fill="x", pady=(sc(2), sc(10)))
 
@@ -2084,7 +2575,7 @@ def launch_gui(store: BootCounterStore) -> None:
         totp_row.pack(fill="x", pady=(0, sc(10)))
         totp_lbl = tk.Label(
             totp_row,
-            text="动态口令：未绑定",
+            text=tr("动态口令：未绑定", "Authenticator (TOTP): Not bound"),
             bg=ACCENT_SOFT,
             fg=TEXT_PRIMARY,
             font=(FONT_UI, 9),
@@ -2094,15 +2585,15 @@ def launch_gui(store: BootCounterStore) -> None:
         def on_setup_bind_totp():
             def _bound(sec, _code):
                 totp_holder["secret"] = sec
-                totp_lbl.configure(text="动态口令：已绑定", fg=SUCCESS)
+                totp_lbl.configure(text=tr("动态口令：已绑定", "Authenticator (TOTP): Bound"), fg=SUCCESS)
                 m_totp_var.set(True)
 
             open_totp_bind_modal(setup_win, _bound)
 
-        make_btn(totp_row, "绑定验证器", on_setup_bind_totp, compact=True).pack(side="right")
+        make_btn(totp_row, tr("绑定验证器", "Bind TOTP"), on_setup_bind_totp, compact=True).pack(side="right")
 
         # 3. 多种保护方式组合（支持多选 + 任一可清 / 全部需验 / 完全禁止）
-        tk.Label(frm, text="清空验证方式", bg=BG_CARD, fg=TEXT_PRIMARY, font=(FONT_UI, 9, "bold")).pack(
+        tk.Label(frm, text=tr("清空验证方式", "Reset Verification Methods"), bg=BG_CARD, fg=TEXT_PRIMARY, font=(FONT_UI, 9, "bold")).pack(
             anchor="w"
         )
         m_pwd_var = tk.BooleanVar(value=True)
@@ -2111,20 +2602,20 @@ def launch_gui(store: BootCounterStore) -> None:
 
         m_row = tk.Frame(frm, bg=BG_CARD)
         m_row.pack(fill="x", pady=(sc(2), sc(4)))
-        tk.Checkbutton(m_row, text="管理密码", variable=m_pwd_var, bg=BG_CARD).pack(side="left", padx=(0, sc(10)))
-        tk.Checkbutton(m_row, text="动态口令", variable=m_totp_var, bg=BG_CARD).pack(side="left", padx=(0, sc(10)))
+        tk.Checkbutton(m_row, text=tr("管理密码", "Admin Password"), variable=m_pwd_var, bg=BG_CARD).pack(side="left", padx=(0, sc(10)))
+        tk.Checkbutton(m_row, text=tr("动态口令", "TOTP"), variable=m_totp_var, bg=BG_CARD).pack(side="left", padx=(0, sc(10)))
         tk.Checkbutton(m_row, text="Windows Hello", variable=m_hello_var, bg=BG_CARD).pack(side="left")
 
         logic_var = tk.StringVar(value=CLEAR_LOGIC_ANY)
-        tk.Radiobutton(frm, text="任意一种方式通过即可清除", variable=logic_var, value=CLEAR_LOGIC_ANY, bg=BG_CARD).pack(anchor="w")
-        tk.Radiobutton(frm, text="全部勾选方式均需通过", variable=logic_var, value=CLEAR_LOGIC_ALL, bg=BG_CARD).pack(anchor="w")
-        tk.Radiobutton(frm, text="完全禁止清除计数", variable=logic_var, value=CLEAR_LOGIC_DISABLED, bg=BG_CARD).pack(anchor="w")
+        tk.Radiobutton(frm, text=tr("任意一种方式通过即可清除", "Any selected method can clear"), variable=logic_var, value=CLEAR_LOGIC_ANY, bg=BG_CARD).pack(anchor="w")
+        tk.Radiobutton(frm, text=tr("全部勾选方式均需通过", "All selected methods required"), variable=logic_var, value=CLEAR_LOGIC_ALL, bg=BG_CARD).pack(anchor="w")
+        tk.Radiobutton(frm, text=tr("完全禁止清除计数", "Disable clearing completely"), variable=logic_var, value=CLEAR_LOGIC_DISABLED, bg=BG_CARD).pack(anchor="w")
 
         # 4. 统计范围与开机自启
         sleep_var = tk.BooleanVar(value=True)
         tk.Checkbutton(
             frm,
-            text="计入合盖睡眠与休眠唤醒",
+            text=tr("计入合盖睡眠与休眠唤醒", "Count sleep / lid-open wakes"),
             variable=sleep_var,
             bg=BG_CARD,
             font=(FONT_UI, 9),
@@ -2133,16 +2624,16 @@ def launch_gui(store: BootCounterStore) -> None:
         auto_var = tk.StringVar(value=AUTOSTART_SILENT)
         auto_row = tk.Frame(frm, bg=BG_CARD)
         auto_row.pack(fill="x")
-        tk.Label(auto_row, text="开机自启：", bg=BG_CARD, fg=TEXT_PRIMARY, font=(FONT_UI, 9, "bold")).pack(side="left")
-        tk.Radiobutton(auto_row, text="静默自启", variable=auto_var, value=AUTOSTART_SILENT, bg=BG_CARD).pack(side="left", padx=(0, sc(6)))
-        tk.Radiobutton(auto_row, text="开机弹窗", variable=auto_var, value=AUTOSTART_GUI, bg=BG_CARD).pack(side="left", padx=(0, sc(6)))
-        tk.Radiobutton(auto_row, text="关闭", variable=auto_var, value=AUTOSTART_OFF, bg=BG_CARD).pack(side="left")
+        tk.Label(auto_row, text=tr("开机自启：", "Autostart:"), bg=BG_CARD, fg=TEXT_PRIMARY, font=(FONT_UI, 9, "bold")).pack(side="left")
+        tk.Radiobutton(auto_row, text=tr("静默自启", "Silent"), variable=auto_var, value=AUTOSTART_SILENT, bg=BG_CARD).pack(side="left", padx=(0, sc(6)))
+        tk.Radiobutton(auto_row, text=tr("开机弹窗", "Show Window"), variable=auto_var, value=AUTOSTART_GUI, bg=BG_CARD).pack(side="left", padx=(0, sc(6)))
+        tk.Radiobutton(auto_row, text=tr("关闭", "Off"), variable=auto_var, value=AUTOSTART_OFF, bg=BG_CARD).pack(side="left")
 
         init_done = {"ok": False, "busy": False}
         setup_prog_frame = tk.Frame(setup_win, bg=BG_MICA)
         tk.Label(
             setup_prog_frame,
-            text="正在生成防伪指纹并建立系统日志基线，请稍候...",
+            text=tr("正在生成防伪指纹并建立系统日志基线，请稍候...", "Generating hardware fingerprint & event log baseline..."),
             bg=BG_MICA,
             fg=ACCENT,
             font=(FONT_UI, 8),
@@ -2181,7 +2672,7 @@ def launch_gui(store: BootCounterStore) -> None:
             chosen_totp = totp_holder["secret"]
 
             init_done["busy"] = True
-            btn_ok.configure(state="disabled", text="正在初始化...")
+            btn_ok.configure(state="disabled", text=tr("正在初始化...", "Initializing..."))
             btn_cancel.configure(state="disabled")
             setup_prog_frame.pack(fill="x", padx=sc(20), pady=(0, sc(4)), before=btn_row)
             setup_pbar.start(12)
@@ -2205,6 +2696,8 @@ def launch_gui(store: BootCounterStore) -> None:
                     res_q.put((False, exc))
 
             def _poll_init():
+                if init_done.get("cancelled"):
+                    return
                 try:
                     ok_flag, err = res_q.get_nowait()
                 except queue.Empty:
@@ -2214,13 +2707,13 @@ def launch_gui(store: BootCounterStore) -> None:
                 setup_prog_frame.pack_forget()
                 init_done["busy"] = False
                 if not ok_flag:
-                    btn_ok.configure(state="normal", text="完成安装并生成防伪指纹")
+                    btn_ok.configure(state="normal", text=tr("完成安装并生成防伪指纹", "Finish Setup"))
                     btn_cancel.configure(state="normal")
                     messagebox.showerror("初始化失败", str(err), parent=setup_win)
                     return
                 fp = store.get_emoji_fingerprint()
                 messagebox.showinfo(
-                    "安装完成 — 请记录安装指纹",
+                    tr("安装完成 — 请记录安装指纹", "Setup Complete — Save Your Fingerprint"),
                     f"本次安装已生成唯一防伪指纹：\n\n"
                     f"        {fp}\n\n"
                     f"请拍照或记下这 6 个 Emoji！\n"
@@ -2235,16 +2728,19 @@ def launch_gui(store: BootCounterStore) -> None:
             setup_win.after(80, _poll_init)
 
         def on_cancel():
-            if init_done["busy"]:
-                return
+            init_done["cancelled"] = True
+            try:
+                setup_pbar.stop()
+            except Exception:
+                pass
             setup_win.destroy()
             root.destroy()
 
         btn_row = tk.Frame(setup_win, bg=BG_MICA)
         btn_row.pack(fill="x", padx=sc(20), pady=sc(8))
-        btn_cancel = make_btn(btn_row, "取消", on_cancel)
+        btn_cancel = make_btn(btn_row, tr("取消", "Cancel"), on_cancel)
         btn_cancel.pack(side="right", padx=(sc(8), 0))
-        btn_ok = make_btn(btn_row, "完成安装并生成防伪指纹", on_confirm, primary=True)
+        btn_ok = make_btn(btn_row, tr("完成安装并生成防伪指纹", "Finish Setup"), on_confirm, primary=True)
         btn_ok.pack(side="right")
 
         setup_win.protocol("WM_DELETE_WINDOW", on_cancel)
@@ -2260,6 +2756,12 @@ def launch_gui(store: BootCounterStore) -> None:
             )
             root.destroy()
             return
+        try:
+            store.verify_binary_integrity_or_raise()
+        except BinaryTamperError as exc:
+            messagebox.showerror("安全拦截 — 程序本体完整性异常", str(exc))
+            root.destroy()
+            sys.exit(1)
         refresh_autostart_path_if_needed(store.state.get("autostart_mode", AUTOSTART_SILENT))
 
     _center_window(root, sc(630), sc(650))
@@ -2276,12 +2778,12 @@ def launch_gui(store: BootCounterStore) -> None:
     audit_bar.pack(fill="x", pady=(0, sc(6)))
     audit_banner = tk.Label(audit_bar, text="", bg=SUCCESS_BG, fg=SUCCESS, font=(FONT_UI, 9, "bold"), anchor="w")
     audit_banner.pack(side="left", fill="x", expand=True)
-    btn_dismiss_alert = make_btn(audit_bar, "消除告警", lambda: on_dismiss_alerts(), compact=True)
+    btn_dismiss_alert = make_btn(audit_bar, tr("消除告警", "Dismiss"), lambda: on_dismiss_alerts(), compact=True)
 
     sync_bar_frame = tk.Frame(container, bg=BG_MICA)
     tk.Label(
         sync_bar_frame,
-        text="正在后台同步 Windows 系统开机与安全日志...",
+        text=tr("正在后台同步 Windows 系统开机与安全日志...", "Syncing Windows boot & security event logs..."),
         bg=BG_MICA,
         fg=ACCENT,
         font=(FONT_UI, 8),
@@ -2299,7 +2801,7 @@ def launch_gui(store: BootCounterStore) -> None:
 
     left_kpi = tk.Frame(kpi_row, bg=BG_CARD)
     left_kpi.pack(side="left", expand=True, fill="x")
-    tk.Label(left_kpi, text="累计开机 / 唤醒次数", bg=BG_CARD, fg=TEXT_SECONDARY, font=(FONT_UI, 10)).pack()
+    tk.Label(left_kpi, text=tr("累计开机 / 唤醒次数", "Total Boots / Wakes"), bg=BG_CARD, fg=TEXT_SECONDARY, font=(FONT_UI, 10)).pack()
     count_var = tk.StringVar()
     tk.Label(left_kpi, textvariable=count_var, bg=BG_CARD, fg=ACCENT, font=(FONT_UI, 32, "bold")).pack(pady=(sc(2), 0))
 
@@ -2307,14 +2809,14 @@ def launch_gui(store: BootCounterStore) -> None:
 
     right_kpi = tk.Frame(kpi_row, bg=BG_CARD)
     right_kpi.pack(side="left", expand=True, fill="x")
-    tk.Label(right_kpi, text="累计重置次数", bg=BG_CARD, fg=TEXT_SECONDARY, font=(FONT_UI, 10)).pack()
+    tk.Label(right_kpi, text=tr("累计重置次数", "Total Resets"), bg=BG_CARD, fg=TEXT_SECONDARY, font=(FONT_UI, 10)).pack()
     reset_count_var = tk.StringVar()
     reset_count_lbl = tk.Label(right_kpi, textvariable=reset_count_var, bg=BG_CARD, fg=TEXT_PRIMARY, font=(FONT_UI, 32, "bold"))
     reset_count_lbl.pack(pady=(sc(2), 0))
 
     fp_box = tk.Frame(hero, bg=ACCENT_SOFT, padx=sc(14), pady=sc(8))
     fp_box.pack(fill="x", pady=(0, sc(10)))
-    tk.Label(fp_box, text="安装指纹", bg=ACCENT_SOFT, fg=TEXT_SECONDARY, font=(FONT_UI, 9)).pack(side="left")
+    tk.Label(fp_box, text=tr("安装指纹", "Install Fingerprint"), bg=ACCENT_SOFT, fg=TEXT_SECONDARY, font=(FONT_UI, 9)).pack(side="left")
     emoji_fp_var = tk.StringVar()
     tk.Label(fp_box, textvariable=emoji_fp_var, bg=ACCENT_SOFT, fg=TEXT_PRIMARY, font=("Segoe UI Emoji", 15)).pack(side="right")
 
@@ -2327,7 +2829,7 @@ def launch_gui(store: BootCounterStore) -> None:
     hist_out, hist_card = make_card(container, padx=12, pady=10)
     hist_out.pack(fill="both", expand=True)
 
-    tk.Label(hist_card, text="近期开机与唤醒记录", bg=BG_CARD, fg=TEXT_PRIMARY, font=(FONT_UI, 10, "bold")).pack(
+    tk.Label(hist_card, text=tr("近期开机与唤醒记录", "Recent Boot & Wake History"), bg=BG_CARD, fg=TEXT_PRIMARY, font=(FONT_UI, 10, "bold")).pack(
         anchor="w", pady=(0, sc(6))
     )
 
@@ -2335,9 +2837,9 @@ def launch_gui(store: BootCounterStore) -> None:
     tree_wrap.pack(fill="both", expand=True)
     cols = ("time", "event", "count")
     tree = ttk.Treeview(tree_wrap, columns=cols, show="headings", style="Win11.Treeview")
-    tree.heading("time", text="发生时间")
-    tree.heading("event", text="事件类型")
-    tree.heading("count", text="当时累计")
+    tree.heading("time", text=tr("发生时间", "Timestamp"))
+    tree.heading("event", text=tr("事件类型", "Event"))
+    tree.heading("count", text=tr("当时累计", "Count"))
     tree.column("time", width=sc(145), minwidth=sc(120), anchor="center")
     tree.column("event", width=sc(300), minwidth=sc(180), anchor="w")
     tree.column("count", width=sc(80), minwidth=sc(65), anchor="center")
@@ -2348,15 +2850,15 @@ def launch_gui(store: BootCounterStore) -> None:
 
     def refresh_ui():
         st = store.state
-        count_var.set(f"{st['boot_count']} 次")
+        count_var.set(tr(f"{st['boot_count']} 次", str(st['boot_count'])))
         rc = int(st.get("reset_count", 0))
-        reset_count_var.set(f"{rc} 次")
+        reset_count_var.set(tr(f"{rc} 次", str(rc)))
         reset_count_lbl.configure(fg=DANGER if rc > 0 else TEXT_PRIMARY)
         emoji_fp_var.set(store.get_emoji_fingerprint())
 
         actual_auto = get_autostart_mode() if IS_WINDOWS else st.get("autostart_mode", AUTOSTART_SILENT)
-        auto_short = {AUTOSTART_SILENT: "静默自启", AUTOSTART_GUI: "开机弹窗", AUTOSTART_OFF: "已关闭"}.get(actual_auto, "-")
-        meta_var.set(f"安装时间：{st['installed_at']}   ·   自启：{auto_short}   ·   清空策略：{store.format_policy_summary()}")
+        auto_short = {AUTOSTART_SILENT: tr("静默自启", "Silent"), AUTOSTART_GUI: tr("开机弹窗", "Window"), AUTOSTART_OFF: tr("已关闭", "Off")}.get(actual_auto, "-")
+        meta_var.set(tr(f"安装时间：{st['installed_at']}   ·   自启：{auto_short}   ·   清空策略：{store.format_policy_summary()}", f"Installed: {st['installed_at']}   ·   Autostart: {auto_short}   ·   Policy: {store.format_policy_summary()}"))
 
         anomalies = st.get("security_anomalies", [])
         total_issues = len(store.tamper_reasons) + len(anomalies)
@@ -2365,7 +2867,7 @@ def launch_gui(store: BootCounterStore) -> None:
             audit_banner.configure(
                 bg=DANGER_BG,
                 fg=DANGER,
-                text=f"⚠ 检测到 {total_issues} 项安全异常（点击「导出审计报告」查看详情）",
+                text=tr(f"⚠ 检测到 {total_issues} 项安全异常（点击「导出审计报告」查看详情）", f"⚠ {total_issues} security alert(s) detected (Export Audit Report for details)"),
             )
             btn_dismiss_alert.pack(side="right", padx=(sc(8), 0))
         else:
@@ -2373,20 +2875,20 @@ def launch_gui(store: BootCounterStore) -> None:
             audit_banner.configure(
                 bg=SUCCESS_BG,
                 fg=SUCCESS,
-                text="✔ 状态正常",
+                text=tr("✔ 状态正常", "✔ All Checks Passed"),
             )
             btn_dismiss_alert.pack_forget()
 
         is_disabled = st.get("clear_logic") == CLEAR_LOGIC_DISABLED or bool(st.get("permanent_lock"))
         if is_disabled:
-            btn_clear.configure(state="disabled", text="清空计数（已禁止）", bg="#E0E0E0", fg="#8A8A8A")
+            btn_clear.configure(state="disabled", text=tr("清空计数（已禁止）", "Reset Disabled"), bg="#E0E0E0", fg="#8A8A8A")
         else:
-            btn_clear.configure(state="normal", text="清空计数", bg=BG_CARD, fg=DANGER)
+            btn_clear.configure(state="normal", text=tr("清空计数", "Reset Count"), bg=BG_CARD, fg=DANGER)
 
         for row in tree.get_children():
             tree.delete(row)
         for item in reversed(st.get("boot_history", [])):
-            tree.insert("", "end", values=(item.get("time", ""), item.get("event", ""), f"{item.get('count_after', 0)} 次"))
+            tree.insert("", "end", values=(item.get("time", ""), item.get("event", ""), tr(f"{item.get('count_after', 0)} 次", str(item.get('count_after', 0)))))
 
     def run_async_sync(show_popup: bool = False):
         if sync_state["running"]:
@@ -2394,7 +2896,7 @@ def launch_gui(store: BootCounterStore) -> None:
         sync_state["running"] = True
         sync_bar_frame.pack(fill="x", pady=(0, sc(8)), before=hero_out)
         sync_pbar.start(12)
-        btn_sync.configure(state="disabled", text="同步中...")
+        btn_sync.configure(state="disabled", text=tr("同步中...", "Syncing..."))
 
         sync_q = queue.Queue()
 
@@ -2414,7 +2916,7 @@ def launch_gui(store: BootCounterStore) -> None:
             sync_pbar.stop()
             sync_bar_frame.pack_forget()
             sync_state["running"] = False
-            btn_sync.configure(state="normal", text="立即同步日志")
+            btn_sync.configure(state="normal", text=tr("立即同步日志", "Sync Logs"))
             refresh_ui()
             if show_popup:
                 if err is not None:
@@ -2576,7 +3078,6 @@ def launch_gui(store: BootCounterStore) -> None:
         _do_dismiss(pwd=pwd, totp=totp, wh_ok=wh_ok)
 
     def on_export_report():
-        store.sync_power_events()
         refresh_ui()
         report_text = store.build_audit_report()
         save_path = filedialog.asksaveasfilename(
@@ -2596,7 +3097,7 @@ def launch_gui(store: BootCounterStore) -> None:
     # =========================
     def open_settings_dialog():
         dlg = tk.Toplevel(root)
-        dlg.title("高级设置 — BootCounter")
+        dlg.title(tr("高级设置 — BootCounter", "Settings — BootCounter"))
         dlg.configure(bg=BG_MICA)
         _center_window(dlg, sc(560), sc(650))
         dlg.minsize(sc(500), sc(560))
@@ -2606,17 +3107,17 @@ def launch_gui(store: BootCounterStore) -> None:
         wrap = tk.Frame(dlg, bg=BG_MICA)
         wrap.pack(fill="both", expand=True, padx=sc(18), pady=sc(14))
 
-        tk.Label(wrap, text="高级设置与多方式安全策略", bg=BG_MICA, fg=TEXT_PRIMARY, font=(FONT_UI, 13, "bold")).pack(
+        tk.Label(wrap, text=tr("高级设置与多方式安全策略", "Settings & Security Policy"), bg=BG_MICA, fg=TEXT_PRIMARY, font=(FONT_UI, 13, "bold")).pack(
             anchor="w", pady=(0, sc(2))
         )
-        tk.Label(wrap, text="修改以下配置需验证管理密码", bg=BG_MICA, fg=TEXT_SECONDARY, font=(FONT_UI, 8)).pack(
+        tk.Label(wrap, text=tr("修改以下配置需验证管理密码", "Admin password is required to change security settings"), bg=BG_MICA, fg=TEXT_SECONDARY, font=(FONT_UI, 8)).pack(
             anchor="w", pady=(0, sc(10))
         )
 
         # 卡片 A：统计范围 & Windows Hello 状态
         c1_out, c1 = make_card(wrap, padx=14, pady=10)
         c1_out.pack(fill="x", pady=(0, sc(10)))
-        tk.Label(c1, text="统计与运行详情", bg=BG_CARD, fg=TEXT_PRIMARY, font=(FONT_UI, 10, "bold")).pack(anchor="w")
+        tk.Label(c1, text=tr("统计与运行详情", "Tracking & Status"), bg=BG_CARD, fg=TEXT_PRIMARY, font=(FONT_UI, 10, "bold")).pack(anchor="w")
         tk.Label(
             c1,
             text=f"本次系统启动：{format_timestamp(get_system_boot_epoch())}   |   动态口令：{'已绑定' if store.has_totp() else '未绑定'}",
@@ -2642,7 +3143,7 @@ def launch_gui(store: BootCounterStore) -> None:
 
         tk.Checkbutton(
             c1,
-            text="计入合盖睡眠与休眠唤醒",
+            text=tr("计入合盖睡眠与休眠唤醒", "Count sleep / lid-open wakes"),
             variable=sleep_var,
             command=on_toggle_sleep,
             bg=BG_CARD,
@@ -2652,14 +3153,14 @@ def launch_gui(store: BootCounterStore) -> None:
         # 卡片 B：Windows 开机自启
         c2_out, c2 = make_card(wrap, padx=14, pady=10)
         c2_out.pack(fill="x", pady=(0, sc(10)))
-        tk.Label(c2, text="Windows 开机自启", bg=BG_CARD, fg=TEXT_PRIMARY, font=(FONT_UI, 10, "bold")).pack(anchor="w", pady=(0, sc(4)))
+        tk.Label(c2, text=tr("Windows 开机自启", "Windows Autostart"), bg=BG_CARD, fg=TEXT_PRIMARY, font=(FONT_UI, 10, "bold")).pack(anchor="w", pady=(0, sc(4)))
         actual_auto = get_autostart_mode() if IS_WINDOWS else store.state.get("autostart_mode", AUTOSTART_SILENT)
         auto_var = tk.StringVar(value=actual_auto)
         auto_row = tk.Frame(c2, bg=BG_CARD)
         auto_row.pack(fill="x")
-        tk.Radiobutton(auto_row, text="静默自启", variable=auto_var, value=AUTOSTART_SILENT, bg=BG_CARD).pack(side="left", padx=(0, sc(8)))
-        tk.Radiobutton(auto_row, text="开机弹出窗口", variable=auto_var, value=AUTOSTART_GUI, bg=BG_CARD).pack(side="left", padx=(0, sc(8)))
-        tk.Radiobutton(auto_row, text="关闭自启", variable=auto_var, value=AUTOSTART_OFF, bg=BG_CARD).pack(side="left")
+        tk.Radiobutton(auto_row, text=tr("静默自启", "Silent"), variable=auto_var, value=AUTOSTART_SILENT, bg=BG_CARD).pack(side="left", padx=(0, sc(8)))
+        tk.Radiobutton(auto_row, text=tr("开机弹出窗口", "Show Window"), variable=auto_var, value=AUTOSTART_GUI, bg=BG_CARD).pack(side="left", padx=(0, sc(8)))
+        tk.Radiobutton(auto_row, text=tr("关闭自启", "Disabled"), variable=auto_var, value=AUTOSTART_OFF, bg=BG_CARD).pack(side="left")
 
         def on_save_auto():
             chosen = auto_var.get()
@@ -2674,12 +3175,12 @@ def launch_gui(store: BootCounterStore) -> None:
             except ValueError as exc:
                 messagebox.showerror("失败", str(exc), parent=dlg)
 
-        make_btn(auto_row, "应用", on_save_auto, primary=True, compact=True).pack(side="right")
+        make_btn(auto_row, tr("应用", "Apply"), on_save_auto, primary=True, compact=True).pack(side="right")
 
         # 卡片 C：多种清空保护方式自由组合
         c3_out, c3 = make_card(wrap, padx=14, pady=10)
         c3_out.pack(fill="x", pady=(0, sc(10)))
-        tk.Label(c3, text="清空保护方式", bg=BG_CARD, fg=TEXT_PRIMARY, font=(FONT_UI, 10, "bold")).pack(
+        tk.Label(c3, text=tr("清空保护方式", "Reset Protection Methods"), bg=BG_CARD, fg=TEXT_PRIMARY, font=(FONT_UI, 10, "bold")).pack(
             anchor="w", pady=(0, sc(4))
         )
 
@@ -2691,8 +3192,8 @@ def launch_gui(store: BootCounterStore) -> None:
 
         cb_row = tk.Frame(c3, bg=BG_CARD)
         cb_row.pack(fill="x", pady=(0, sc(4)))
-        tk.Checkbutton(cb_row, text="管理密码", variable=cb_pwd, bg=BG_CARD, state="disabled" if is_perm else "normal").pack(side="left", padx=(0, sc(8)))
-        tk.Checkbutton(cb_row, text="动态口令", variable=cb_totp, bg=BG_CARD, state="disabled" if is_perm else "normal").pack(side="left", padx=(0, sc(8)))
+        tk.Checkbutton(cb_row, text=tr("管理密码", "Admin Password"), variable=cb_pwd, bg=BG_CARD, state="disabled" if is_perm else "normal").pack(side="left", padx=(0, sc(8)))
+        tk.Checkbutton(cb_row, text=tr("动态口令", "TOTP"), variable=cb_totp, bg=BG_CARD, state="disabled" if is_perm else "normal").pack(side="left", padx=(0, sc(8)))
         tk.Checkbutton(cb_row, text="Windows Hello", variable=cb_hello, bg=BG_CARD, state="disabled" if is_perm else "normal").pack(side="left")
 
         logic_var = tk.StringVar(value=store.state.get("clear_logic", CLEAR_LOGIC_ANY))
@@ -2799,30 +3300,54 @@ def launch_gui(store: BootCounterStore) -> None:
 
         p_btns = tk.Frame(c3, bg=BG_CARD)
         p_btns.pack(fill="x", pady=(sc(8), 0))
-        b_save = make_btn(p_btns, "保存策略", on_save_policy, primary=True, compact=True)
+        b_save = make_btn(p_btns, tr("保存策略", "Save Policy"), on_save_policy, primary=True, compact=True)
         b_save.pack(side="left", padx=(0, sc(6)))
-        make_btn(p_btns, "绑定动态口令", on_bind_totp, compact=True).pack(side="left", padx=(0, sc(6)))
-        make_btn(p_btns, "测试 Windows Hello", on_test_hello, compact=True).pack(side="left", padx=(0, sc(6)))
-        b_lock = make_btn(p_btns, "永久锁定", on_perm_lock, danger=True, compact=True)
+        make_btn(p_btns, tr("绑定动态口令", "Bind TOTP"), on_bind_totp, compact=True).pack(side="left", padx=(0, sc(6)))
+        make_btn(p_btns, tr("测试 Windows Hello", "Test Hello"), on_test_hello, compact=True).pack(side="left", padx=(0, sc(6)))
+        b_lock = make_btn(p_btns, tr("永久锁定", "Permanent Lock"), on_perm_lock, danger=True, compact=True)
         b_lock.pack(side="left")
         if is_perm:
             b_save.configure(state="disabled")
-            b_lock.configure(state="disabled", text="已永久锁定")
+            b_lock.configure(state="disabled", text=tr("已永久锁定", "Locked"))
+
+        # 卡片 D：界面语言切换（支持自动跟随系统 / 简体中文 / English）
+        c4_out, c4 = make_card(wrap, padx=14, pady=8)
+        c4_out.pack(fill="x", pady=(0, sc(10)))
+        lang_row = tk.Frame(c4, bg=BG_CARD)
+        lang_row.pack(fill="x")
+        tk.Label(lang_row, text=tr("界面语言 / Language", "Language"), bg=BG_CARD, fg=TEXT_PRIMARY, font=(FONT_UI, 9, "bold")).pack(
+            side="left", padx=(0, sc(10))
+        )
+        lang_var = tk.StringVar(value=store.state.get("language", LANG_AUTO))
+        tk.Radiobutton(lang_row, text=tr("跟随系统", "Auto"), variable=lang_var, value=LANG_AUTO, bg=BG_CARD).pack(side="left", padx=(0, sc(8)))
+        tk.Radiobutton(lang_row, text="简体中文", variable=lang_var, value=LANG_ZH, bg=BG_CARD).pack(side="left", padx=(0, sc(8)))
+        tk.Radiobutton(lang_row, text="English", variable=lang_var, value=LANG_EN, bg=BG_CARD).pack(side="left")
+
+        def on_save_lang():
+            store.set_language(lang_var.get())
+            refresh_ui()
+            messagebox.showinfo(
+                tr("语言已更新", "Language Updated"),
+                tr("语言偏好已保存，重新打开程序即可完整生效。", "Language saved. Please reopen BootCounter for all labels to update."),
+                parent=dlg,
+            )
+
+        make_btn(lang_row, tr("应用", "Apply"), on_save_lang, compact=True).pack(side="right")
 
         foot = tk.Frame(wrap, bg=BG_MICA)
         foot.pack(fill="x", pady=(sc(4), 0))
-        make_btn(foot, "修改管理密码", on_change_pwd).pack(side="left")
-        make_btn(foot, "关闭", dlg.destroy).pack(side="right")
+        make_btn(foot, tr("修改管理密码", "Change Password"), on_change_pwd).pack(side="left")
+        make_btn(foot, tr("关闭", "Close"), dlg.destroy).pack(side="right")
 
-    make_btn(action_bar, "导出审计报告", on_export_report, primary=True).pack(side="left", padx=(0, sc(8)))
-    btn_sync = make_btn(action_bar, "立即同步日志", lambda: run_async_sync(show_popup=True))
+    make_btn(action_bar, tr("导出审计报告", "Export Report"), on_export_report, primary=True).pack(side="left", padx=(0, sc(8)))
+    btn_sync = make_btn(action_bar, tr("立即同步日志", "Sync Logs"), lambda: run_async_sync(show_popup=True))
     btn_sync.pack(side="left", padx=(0, sc(8)))
-    btn_clear = make_btn(action_bar, "清空计数", on_clear_count)
+    btn_clear = make_btn(action_bar, tr("清空计数", "Reset Count"), on_clear_count)
     btn_clear.pack(side="left", padx=(0, sc(8)))
-    make_btn(action_bar, "⚙ 高级设置", open_settings_dialog).pack(side="right")
+    make_btn(action_bar, tr("⚙ 高级设置", "⚙ Settings"), open_settings_dialog).pack(side="right")
 
     tray_q = queue.Queue()
-    tray = Win32TrayIcon(_ico, f"BootCounter — 累计开机 {store.state.get('boot_count', 0)} 次", tray_q)
+    tray = Win32TrayIcon(_ico, tr(f"BootCounter — 累计开机 {store.state.get('boot_count', 0)} 次", f"BootCounter — Total Boots: {store.state.get('boot_count', 0)}"), tray_q)
     tray.start()
 
     def _poll_tray():
@@ -2844,7 +3369,7 @@ def launch_gui(store: BootCounterStore) -> None:
         except queue.Empty:
             pass
         if store.state:
-            tray.update_tooltip(f"BootCounter — 累计开机 {store.state.get('boot_count', 0)} 次")
+            tray.update_tooltip(tr(f"BootCounter — 累计开机 {store.state.get('boot_count', 0)} 次", f"BootCounter — Total Boots: {store.state.get('boot_count', 0)}"))
         root.after(200, _poll_tray)
 
     def _on_close_to_tray():
@@ -2863,6 +3388,18 @@ def launch_gui(store: BootCounterStore) -> None:
 
 
 def main():
+    if "--destroy-tpm-key" in sys.argv:
+        tpm_destroy_hardware_key()
+        return
+    dbg_reason = check_debugger_attached()
+    if dbg_reason:
+        if IS_WINDOWS:
+            try:
+                ctypes.windll.user32.MessageBoxW(None, tr(f"安全拦截：{dbg_reason}，程序已停止运行。", f"Security Block: {dbg_reason}. Execution halted."), tr("BootCounter 安全保护", "BootCounter Security"), 0x10)
+            except Exception:
+                pass
+        sys.exit(1)
+    harden_process_anti_debug()
     store = BootCounterStore()
     if "--boot" in sys.argv:
         if store.exists() and store.load():

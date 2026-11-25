@@ -1,5 +1,5 @@
 ﻿#define MyAppName "BootCounter"
-#define MyAppVersion "1.0.0"
+#define MyAppVersion "1.1.0"
 #define MyAppPublisher "BootCounter"
 #define MyAppExeName "BootCounter.exe"
 
@@ -21,7 +21,7 @@ RestartApplications=no
 SetupIconFile=app.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
 OutputDir=dist
-OutputBaseFilename=BootCounter_Setup_{#MyAppVersion}
+OutputBaseFilename=BootCounter_Setup_{#MyAppVersion}_amd64
 Compression=lzma2
 SolidCompression=yes
 ArchitecturesInstallIn64BitMode=x64compatible
@@ -29,8 +29,8 @@ ShowLanguageDialog=auto
 UsePreviousLanguage=no
 
 [Languages]
-Name: "chinesesimplified"; MessagesFile: "ChineseSimplified.isl"
 Name: "english"; MessagesFile: "compiler:Default.isl"
+Name: "chinesesimplified"; MessagesFile: "ChineseSimplified.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"
@@ -70,8 +70,14 @@ begin
 end;
 
 function InitializeUninstall(): Boolean;
+var
+  ExePath: String;
+  ResultCode: Integer;
 begin
   KillRunningBootCounter();
+  ExePath := ExpandConstant('{app}\BootCounter.exe');
+  if FileExists(ExePath) then
+    Exec(ExePath, '--destroy-tpm-key', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   Result := True;
 end;
 
